@@ -5,7 +5,7 @@ Iron Man-style voice assistant that controls RGB lighting, runs diagnostics,
 scans the network, and triggers dramatic boot sequences via an MCP server
 running on the Windows host.
 
-MCP Server URL is auto-resolved from WSL → Windows host IP.
+MCP Server URL is auto-resolved from WSL ->Windows host IP.
 
 Run:
   uv run agent_friday.py dev      – LiveKit Cloud mode
@@ -22,25 +22,26 @@ from livekit.agents.voice import Agent, AgentSession
 from livekit.agents.llm import mcp
 
 # Plugins
-from livekit.plugins import google as lk_google, openai as lk_openai, sarvam, silero
+from livekit.plugins import google as lk_google, openai as lk_openai, sarvam, silero, deepgram
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
-STT_PROVIDER       = "sarvam"
+STT_PROVIDER       = "deepgram"  # sarvam saaras:v3 streaming never returned transcripts on Windows
 LLM_PROVIDER       = "gemini"
-TTS_PROVIDER       = "openai"
+TTS_PROVIDER       = "sarvam"
 
 GEMINI_LLM_MODEL   = "gemini-2.5-flash"
 OPENAI_LLM_MODEL   = "gpt-4o"
 
 OPENAI_TTS_MODEL   = "tts-1"
 OPENAI_TTS_VOICE   = "nova"       # "nova" has a clean, confident female tone
-TTS_SPEED           = 1.15
+TTS_SPEED           = 1.0        # 1.15 stammered on streamed chunks; 1.0 is smooth
 
 SARVAM_TTS_LANGUAGE = "en-IN"
-SARVAM_TTS_SPEAKER  = "rahul"
+SARVAM_TTS_SPEAKER  = "anushka"  # bulbul:v2 female: anushka | manisha | vidya | arya
+SARVAM_TTS_PITCH    = -0.1       # slightly deeper — calmer, composed FRIDAY tone
 
 # MCP server running on Windows host
 MCP_SERVER_PORT = 8000
@@ -202,27 +203,31 @@ def _mcp_server_url() -> str:
 
 def _build_stt():
     if STT_PROVIDER == "sarvam":
-        logger.info("STT → Sarvam Saaras v3")
+        logger.info("STT ->Sarvam Saaras v3")
         return sarvam.STT(
-            language="unknown",
+            language="en-IN",              # "unknown" auto-detect is unreliable on short utterances
             model="saaras:v3",
             mode="transcribe",
             flush_signal=True,
             sample_rate=16000,
+            high_vad_sensitivity=True,     # server VAD wasn't triggering on console mic level
         )
     elif STT_PROVIDER == "whisper":
-        logger.info("STT → OpenAI Whisper")
+        logger.info("STT ->OpenAI Whisper")
         return lk_openai.STT(model="whisper-1")
+    elif STT_PROVIDER == "deepgram":
+        logger.info("STT -> Deepgram nova-3")
+        return deepgram.STT(model="nova-3", language="en-US")
     else:
         raise ValueError(f"Unknown STT_PROVIDER: {STT_PROVIDER!r}")
 
 
 def _build_llm():
     if LLM_PROVIDER == "openai":
-        logger.info("LLM → OpenAI (%s)", OPENAI_LLM_MODEL)
+        logger.info("LLM ->OpenAI (%s)", OPENAI_LLM_MODEL)
         return lk_openai.LLM(model=OPENAI_LLM_MODEL)
     elif LLM_PROVIDER == "gemini":
-        logger.info("LLM → Google Gemini (%s)", GEMINI_LLM_MODEL)
+        logger.info("LLM ->Google Gemini (%s)", GEMINI_LLM_MODEL)
         return lk_google.LLM(model=GEMINI_LLM_MODEL, api_key=os.getenv("GOOGLE_API_KEY"))
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}")
@@ -230,15 +235,16 @@ def _build_llm():
 
 def _build_tts():
     if TTS_PROVIDER == "sarvam":
-        logger.info("TTS → Sarvam Bulbul v3")
+        logger.info("TTS ->Sarvam Bulbul v2")
         return sarvam.TTS(
             target_language_code=SARVAM_TTS_LANGUAGE,
-            model="bulbul:v3",
+            model="bulbul:v2",
             speaker=SARVAM_TTS_SPEAKER,
             pace=TTS_SPEED,
+            pitch=SARVAM_TTS_PITCH,
         )
     elif TTS_PROVIDER == "openai":
-        logger.info("TTS → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
+        logger.info("TTS ->OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
         return lk_openai.TTS(model=OPENAI_TTS_MODEL, voice=OPENAI_TTS_VOICE, speed=TTS_SPEED)
     else:
         raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")
@@ -304,11 +310,13 @@ class FridayAgent(Agent):
 # ---------------------------------------------------------------------------
 
 def _turn_detection() -> str:
-    return "stt" if STT_PROVIDER == "sarvam" else "vad"
+    # saaras:v3 streaming never emits end-of-turn signals, so "stt" turn detection
+    # deadlocks (audio streams forever, never flushed). Silero VAD segments reliably.
+    return "vad"
 
 
 def _endpointing_delay() -> float:
-    return {"sarvam": 0.07, "whisper": 0.3}.get(STT_PROVIDER, 0.1)
+    return {"sarvam": 0.5, "whisper": 0.3, "deepgram": 0.5}.get(STT_PROVIDER, 0.1)
 
 
 async def entrypoint(ctx: JobContext) -> None:
